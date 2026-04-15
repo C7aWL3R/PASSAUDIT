@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  PassAudit — Password Strength Analyzer  v2.1.0                ║
+║  PassAudit — Password Strength Analyzer  v2.2.0                ║
 ║  Author : C7aWL3R                                              ║
 ║  License: MIT                                                  ║
 ║                                                                ║
@@ -9,8 +9,16 @@
 ║    • Mathematical entropy  (E = L × log₂R)                    ║
 ║    • Deep pattern recognition  (zxcvbn)                        ║
 ║    • Privacy-preserving breach lookup  (HIBP k-Anonymity)      ║
-║    • Forensic memory sanitisation  (ctypes)                    ║
+║    • Forensic memory sanitisation  (ctypes, best-effort)       ║
 ╚══════════════════════════════════════════════════════════════════╝
+
+v2.2.0 changelog (third-party review):
+  • HIBP response streamed via iter_lines() — no bulk allocation
+  • zxcvbn wrapped in SIGALRM timeout (5 s) to cap runaway regex
+  • Brittle global inflight state replaced with _SecureContext CM
+  • Entropy caveat added to report and methodology screen
+  • MAX_PASSWORD_LENGTH reduced 512 → 128
+  • Memory wipe documented as best-effort with known CPython limits
 """
 
 # ─── Standard Library ────────────────────────────────────────────
@@ -35,14 +43,15 @@ from rich.table import Table
 from rich.text import Text
 
 # ─── Constants ───────────────────────────────────────────────────
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 HIBP_API_URL = "https://api.pwnedpasswords.com/range/"
 HIBP_USER_AGENT = f"PassAudit/{VERSION}"
 REQUEST_TIMEOUT = 10
-MAX_PASSWORD_LENGTH = 512
+MAX_PASSWORD_LENGTH = 128
+ZXCVBN_TIMEOUT = 5  # seconds — caps runaway pattern matching
 
-OFFLINE_GPU_SPEED = 100_000_000_000   # 100 B H/s (high-end GPU rig)
-ONLINE_THROTTLED_SPEED = 100          # 100 att/s (rate-limited web login)
+OFFLINE_GPU_SPEED = 100_000_000_000
+ONLINE_THROTTLED_SPEED = 100
 
 console = Console()
 
@@ -69,14 +78,107 @@ MENU = """
 """
 
 # ─── Character Pools ─────────────────────────────────────────────
-_LOWER = set("abcdefghijklmnopqrstuvwxyz")                     # 26
-_UPPER = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")                     # 26
-_DIGIT = set("0123456789")                                     # 10
-_SYMBOL = set(" !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")          # 33
+_LOWER = set("abcdefghijklmnopqrstuvwxyz")
+_UPPER = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_DIGIT = set("0123456789")
+_SYMBOL = set(" !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
-# ─── Inflight State (for signal-handler cleanup) ─────────────────
-_inflight_password = None
-_inflight_zxcvbn = None
+
+# ═══════════════════════════════════════════════════════════════════
+#  Memory Sanitisation
+# ═══════════════════════════════════════════════════════════════════
+
+def _str_char_width(s: str) -> int:
+    """Per-character byte width for CPython's internal encoding."""
+    m = max((ord(c) for c in s), default=0)
+    if m <= 0xFF:
+        return 1
+    if m <= 0xFFFF:
+        return 2
+    return 4
+
+
+def _secure_wipe_str(secret: str) -> None:
+    """Zero the character-data region of a CPython str object.
+
+    IMPORTANT — BEST-EFFORT ONLY.  Python strings are immutable.
+    Copies may persist in: getpass/termios OS buffers, CPython's
+    internal memory allocator arenas, GC generations, and any
+    library (hashlib, zxcvbn) that held a reference.  This wipe
+    reduces the window of exposure but cannot guarantee the password
+    is fully removed from process memory.  For a hard guarantee,
+    input collection and hashing must be implemented in C/Rust
+    using mlock'd mutable buffers.
+
+    Guards:
+        Skips strings <= 3 chars (auto-interned by CPython).
+        Detects UCS-1/2/4 width to compute correct byte count.
+        Targets only the inline data buffer, not the PyObject header.
+    """
+    if not secret or len(secret) <= 3:
+        return
+    try:
+        char_width = _str_char_width(secret)
+        total_size = sys.getsizeof(secret)
+        data_bytes = len(secret) * char_width + char_width
+        offset = max(total_size - data_bytes, 0)
+        ctypes.memset(id(secret) + offset, 0, data_bytes)
+    except Exception:
+        pass
+
+
+def _secure_cleanup(password: str, zxcvbn_result: dict) -> None:
+    """Wipe the password and any token copies retained by zxcvbn."""
+    for pat in zxcvbn_result.get("patterns", []):
+        token = pat.get("token", "")
+        if token:
+            _secure_wipe_str(token)
+    _secure_wipe_str(password)
+    gc.collect()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Secure Context Manager
+# ═══════════════════════════════════════════════════════════════════
+
+class _SecureContext:
+    """Deterministic cleanup for in-flight password state.
+
+    Replaces the brittle global-variable approach.  Ensures the
+    password is wiped on normal exit, exception, or signal, even
+    if an error occurs deep inside requests or zxcvbn.
+    """
+    _active = None  # class-level reference for the signal handler
+
+    def __init__(self, password: str):
+        self.password = password
+        self.zxcvbn_result = None
+
+    def __enter__(self):
+        _SecureContext._active = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._cleanup()
+        _SecureContext._active = None
+        return False  # do not suppress exceptions
+
+    def _cleanup(self):
+        if self.zxcvbn_result is not None:
+            _secure_cleanup(self.password, self.zxcvbn_result)
+        else:
+            _secure_wipe_str(self.password)
+        gc.collect()
+
+    @classmethod
+    def signal_cleanup(cls):
+        """Called from the signal handler to wipe in-flight data."""
+        if cls._active is not None:
+            try:
+                cls._active._cleanup()
+            except Exception:
+                pass
+            cls._active = None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -84,20 +186,8 @@ _inflight_zxcvbn = None
 # ═══════════════════════════════════════════════════════════════════
 
 def _handle_signal(signum, frame):
-    """Wipe any in-flight password, then exit."""
-    global _inflight_password, _inflight_zxcvbn
-    if _inflight_password is not None:
-        try:
-            _secure_wipe_str(_inflight_password)
-        except Exception:
-            pass
-        _inflight_password = None
-    if _inflight_zxcvbn is not None:
-        try:
-            secure_cleanup("", _inflight_zxcvbn)
-        except Exception:
-            pass
-        _inflight_zxcvbn = None
+    """Wipe any in-flight password via the context manager, then exit."""
+    _SecureContext.signal_cleanup()
     console.print("\n[dim]Signal received — exiting cleanly.[/dim]")
     sys.exit(0)
 
@@ -110,8 +200,8 @@ signal.signal(signal.SIGTERM, _handle_signal)
 #  1. Entropy Engine
 # ═══════════════════════════════════════════════════════════════════
 
-def calculate_charset_size(password: str) -> int:
-    """Effective character-set size (R) based on character classes present."""
+def _calculate_charset_size(password: str) -> int:
+    """Effective character-set size (R) based on character classes."""
     chars = set(password)
     size = 0
     if chars & _LOWER:
@@ -127,15 +217,21 @@ def calculate_charset_size(password: str) -> int:
     return max(size, 1)
 
 
-def compute_entropy(password: str) -> float:
-    """Entropy in bits: E = L × log₂(R)."""
+def _compute_entropy(password: str) -> float:
+    """Entropy in bits: E = L × log₂(R).
+
+    NOTE: This is the theoretical maximum for a perfectly random
+    string of this length and character set.  It does not account
+    for dictionary words, patterns, or predictable structure.
+    The zxcvbn score provides the practical strength estimate.
+    """
     length = len(password)
     if length == 0:
         return 0.0
-    return length * math.log2(calculate_charset_size(password))
+    return length * math.log2(_calculate_charset_size(password))
 
 
-def classify_entropy(bits: float) -> tuple:
+def _classify_entropy(bits: float) -> tuple:
     """Map entropy → (label, emoji, rich_style)."""
     if bits < 40:
         return ("Critical", "🔴", "bold red")
@@ -149,26 +245,48 @@ def classify_entropy(bits: float) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  2. Pattern Recognition (zxcvbn)
+#  2. Pattern Recognition (zxcvbn) — with SIGALRM timeout
 # ═══════════════════════════════════════════════════════════════════
 
-def analyse_patterns(password: str) -> dict:
-    """Run zxcvbn and return a structured result dict.
+class _ZxcvbnTimeout(Exception):
+    """Raised when zxcvbn exceeds the analysis deadline."""
 
-    The ``result["password"]`` key (same reference as the caller's
-    string) is deleted so it doesn't leak through the return value.
-    Actual memory wipe is deferred to ``secure_cleanup()``.
+
+def _zxcvbn_alarm_handler(signum, frame):
+    raise _ZxcvbnTimeout()
+
+
+def _analyse_patterns(password: str) -> dict:
+    """Run zxcvbn with a SIGALRM timeout.
+
+    On Linux, signal.alarm() fires SIGALRM after ZXCVBN_TIMEOUT
+    seconds, interrupting any catastrophic backtracking in the
+    pure-Python zxcvbn port.
     """
+    error_template = {
+        "score": -1, "guesses": 0, "guesses_log10": 0,
+        "crack_offline": "N/A", "crack_online_throttled": "N/A",
+        "crack_online_unthrottled": "N/A", "crack_offline_fast": "N/A",
+        "warning": "", "suggestions": [], "patterns": [], "error": True,
+    }
+
+    old_handler = signal.getsignal(signal.SIGALRM)
     try:
+        signal.signal(signal.SIGALRM, _zxcvbn_alarm_handler)
+        signal.alarm(ZXCVBN_TIMEOUT)
         result = zxcvbn_lib.zxcvbn(password)
+        signal.alarm(0)  # cancel timer on success
+    except _ZxcvbnTimeout:
+        error_template["warning"] = (
+            f"Pattern analysis timed out ({ZXCVBN_TIMEOUT}s)")
+        return error_template
     except Exception as exc:
-        return {
-            "score": -1, "guesses": 0, "guesses_log10": 0,
-            "crack_offline": "N/A", "crack_online_throttled": "N/A",
-            "crack_online_unthrottled": "N/A", "crack_offline_fast": "N/A",
-            "warning": f"zxcvbn analysis failed: {type(exc).__name__}",
-            "suggestions": [], "patterns": [], "error": True,
-        }
+        signal.alarm(0)
+        error_template["warning"] = (
+            f"zxcvbn analysis failed: {type(exc).__name__}")
+        return error_template
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
 
     result.pop("password", None)
 
@@ -208,15 +326,15 @@ def _zxcvbn_score_label(score: int) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  3. Breach Check — HIBP k-Anonymity
+#  3. Breach Check — HIBP k-Anonymity (streamed)
 # ═══════════════════════════════════════════════════════════════════
 
-def check_hibp(password: str) -> tuple:
-    """Query Have I Been Pwned using k-Anonymity.
+def _check_hibp(password: str) -> tuple:
+    """Query Have I Been Pwned using k-Anonymity with streamed response.
 
-    The password is SHA-1-hashed locally.  Only the first 5 hex
-    characters are sent to the API; the remaining 35 are matched
-    locally.  The full hash and suffix are wiped from memory after use.
+    The response is consumed line-by-line via iter_lines() to avoid
+    loading the full suffix list (several MB, hundreds of thousands
+    of hashes) into memory as a single string.
 
     Returns ``(breached, count, error_msg | None)``.
     """
@@ -232,27 +350,20 @@ def check_hibp(password: str) -> tuple:
     _secure_wipe_str(sha1_hash)
     del sha1_hash
 
+    resp = None
     try:
         resp = requests.get(
             f"{HIBP_API_URL}{prefix}",
             headers={"User-Agent": HIBP_USER_AGENT},
             timeout=REQUEST_TIMEOUT,
             verify=True,
+            stream=True,
         )
         resp.raise_for_status()
-    except requests.ConnectionError:
-        return False, -1, "No network connection"
-    except requests.Timeout:
-        return False, -1, f"Request timed out ({REQUEST_TIMEOUT}s)"
-    except requests.HTTPError as exc:
-        code = getattr(exc.response, "status_code", "?") \
-            if exc.response else "?"
-        return False, -1, f"HTTP {code}"
-    except requests.RequestException as exc:
-        return False, -1, type(exc).__name__
 
-    try:
-        for line in resp.text.splitlines():
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
             parts = line.strip().split(":")
             if len(parts) != 2:
                 continue
@@ -262,7 +373,19 @@ def check_hibp(password: str) -> tuple:
                 except (ValueError, OverflowError):
                     return True, 1, "Breach count unparseable"
                 return True, count, None
+    except requests.ConnectionError:
+        return False, -1, "Connection lost"
+    except requests.Timeout:
+        return False, -1, f"Request timed out ({REQUEST_TIMEOUT}s)"
+    except requests.HTTPError as exc:
+        code = getattr(exc.response, "status_code", "?") \
+            if exc.response else "?"
+        return False, -1, f"HTTP {code}"
+    except requests.RequestException as exc:
+        return False, -1, type(exc).__name__
     finally:
+        if resp is not None:
+            resp.close()
         _secure_wipe_str(suffix)
         del suffix
 
@@ -297,10 +420,10 @@ def _format_seconds(seconds: float) -> str:
     return ", ".join(parts) if parts else "< 1 second"
 
 
-def estimate_crack_times(password: str) -> dict:
+def _estimate_crack_times(password: str) -> dict:
     """Crack time via log₂ arithmetic — safe for any password length."""
     length = len(password)
-    log2_ks = length * math.log2(calculate_charset_size(password)) \
+    log2_ks = length * math.log2(_calculate_charset_size(password)) \
         if length else 0.0
 
     def _seconds(speed: float) -> float:
@@ -318,63 +441,7 @@ def estimate_crack_times(password: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  5. Memory Sanitisation
-# ═══════════════════════════════════════════════════════════════════
-
-def _str_char_width(s: str) -> int:
-    """Per-character byte width for CPython's internal encoding.
-
-    CPython uses the narrowest encoding that fits every codepoint:
-    1 (Latin-1 / ASCII), 2 (UCS-2 / BMP), or 4 (UCS-4 / emoji).
-    """
-    m = max((ord(c) for c in s), default=0)
-    if m <= 0xFF:
-        return 1
-    if m <= 0xFFFF:
-        return 2
-    return 4
-
-
-def _secure_wipe_str(secret: str) -> None:
-    """Zero the character-data region of a CPython str object.
-
-    Targets only the inline data buffer, leaving the PyObject header
-    (refcount, type pointer, hash) intact so the object can still be
-    garbage-collected without crashing.
-
-    Guards:
-        Skips strings <= 3 chars (auto-interned by CPython).
-        Detects UCS-1/2/4 width to compute correct byte count.
-
-    Limitations:
-        Best-effort.  CPython may have interned or copied the string.
-        GC / allocator may reuse memory before the wipe executes.
-        For production credential handling, prefer mlock'd byte buffers.
-    """
-    if not secret or len(secret) <= 3:
-        return
-    try:
-        char_width = _str_char_width(secret)
-        total_size = sys.getsizeof(secret)
-        data_bytes = len(secret) * char_width + char_width  # +NUL
-        offset = max(total_size - data_bytes, 0)
-        ctypes.memset(id(secret) + offset, 0, data_bytes)
-    except Exception:
-        pass
-
-
-def secure_cleanup(password: str, zxcvbn_result: dict) -> None:
-    """Wipe the password and any token copies retained by zxcvbn."""
-    for pat in zxcvbn_result.get("patterns", []):
-        token = pat.get("token", "")
-        if token:
-            _secure_wipe_str(token)
-    _secure_wipe_str(password)
-    gc.collect()
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  6. Strength Meter
+#  5. Strength Meter
 # ═══════════════════════════════════════════════════════════════════
 
 def _strength_bar(score_pct: float, width: int = 36) -> str:
@@ -395,7 +462,7 @@ def _strength_bar(score_pct: float, width: int = 36) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  7. Report Renderer
+#  6. Report Renderer
 # ═══════════════════════════════════════════════════════════════════
 
 def _render_report(
@@ -412,7 +479,8 @@ def _render_report(
     charset_size: int,
 ) -> None:
     """Print the full analysis report to the terminal."""
-    zx_label, zx_emoji, zx_style = _zxcvbn_score_label(zxcvbn_result["score"])
+    zx_label, zx_emoji, zx_style = _zxcvbn_score_label(
+        zxcvbn_result["score"])
 
     # Verdict
     if breached and breach_count > 0:
@@ -433,11 +501,13 @@ def _render_report(
         combined = min(combined, 0.10)
 
     console.print()
-    console.print(Rule("[bold bright_cyan]  ANALYSIS REPORT  [/bold bright_cyan]",
-                       style="bright_cyan"))
+    console.print(Rule(
+        "[bold bright_cyan]  ANALYSIS REPORT  [/bold bright_cyan]",
+        style="bright_cyan"))
     console.print()
     console.print(Panel(
-        Text.from_markup(f"  Overall Strength:  {_strength_bar(combined)}"),
+        Text.from_markup(
+            f"  Overall Strength:  {_strength_bar(combined)}"),
         border_style=v_style.replace("bold ", ""),
         box=box.HEAVY,
         title=f" {v_emoji} {verdict} ",
@@ -454,25 +524,27 @@ def _render_report(
 
     tbl.add_row("Password Length", str(pw_len), "🔵")
     tbl.add_row("Character-Set Size (R)", str(charset_size), "🔵")
-    tbl.add_row("Entropy (bits)", f"{entropy_bits:.2f}", entropy_emoji)
-    tbl.add_row("Entropy Rating",
+    tbl.add_row("Entropy (bits) [dim]theoretical[/dim]",
+                f"{entropy_bits:.2f}", entropy_emoji)
+    tbl.add_row("Entropy Rating [dim]if random[/dim]",
                 f"[{entropy_style}]{entropy_label}[/{entropy_style}]",
                 entropy_emoji)
     if zxcvbn_result.get("error"):
-        tbl.add_row("zxcvbn Score", "[red]Analysis failed[/red]", "⚠️")
+        tbl.add_row("zxcvbn Score [dim]practical[/dim]",
+                     "[red]Analysis failed[/red]", "⚠️")
     else:
         tbl.add_row(
-            "zxcvbn Score",
-            f"[{zx_style}]{zxcvbn_result['score']}/4 — {zx_label}[/{zx_style}]",
-            zx_emoji)
+            "zxcvbn Score [dim]practical[/dim]",
+            f"[{zx_style}]{zxcvbn_result['score']}/4 "
+            f"— {zx_label}[/{zx_style}]", zx_emoji)
     if breach_count == -1:
         tbl.add_row("HIBP Breach Status",
                      f"[yellow]Unavailable[/yellow] "
                      f"({rich_escape(breach_error)})", "⚠️")
     elif breached:
         tbl.add_row("HIBP Breach Status",
-                     f"[bold red]YES — seen {breach_count:,} times[/bold red]",
-                     "🔴")
+                     f"[bold red]YES — seen {breach_count:,} "
+                     f"times[/bold red]", "🔴")
     else:
         tbl.add_row("HIBP Breach Status",
                      "[green]Not found in known breaches[/green]", "🟢")
@@ -480,16 +552,34 @@ def _render_report(
                 f"[{v_style}]{verdict}[/{v_style}]", v_emoji)
     console.print(tbl)
 
+    # Entropy caveat
+    if (entropy_bits >= 60
+            and not zxcvbn_result.get("error")
+            and zxcvbn_result["score"] <= 2):
+        console.print(Panel(
+            "[yellow]⚠[/yellow]  Entropy is high but zxcvbn detected "
+            "predictable patterns.  Shannon entropy\n"
+            "   measures the [bold]theoretical maximum[/bold] for a "
+            "random string of this length and charset.\n"
+            "   The zxcvbn score reflects [bold]practical strength[/bold]"
+            " against modern cracking dictionaries.",
+            border_style="yellow", box=box.ROUNDED,
+            title="[bold yellow] Entropy ≠ Strength [/bold yellow]",
+        ))
+
     # ── Crack times ──
     ct = Table(box=box.ROUNDED,
-               title="[bold bright_cyan]Estimated Crack Time[/bold bright_cyan]",
+               title="[bold bright_cyan]Estimated Crack Time"
+                     "[/bold bright_cyan]",
                header_style="bold", show_lines=True, padding=(0, 1))
     ct.add_column("Scenario", style="cyan", min_width=35)
     ct.add_column("Time to Exhaust Keyspace", min_width=30)
-    ct.add_row(f"Offline GPU ({OFFLINE_GPU_SPEED / 1e9:.0f}B H/s)",
-               crack_times["offline_gpu"])
-    ct.add_row(f"Online Throttled ({ONLINE_THROTTLED_SPEED} att/s)",
-               crack_times["online_throttled"])
+    ct.add_row(
+        f"Offline GPU ({OFFLINE_GPU_SPEED / 1e9:.0f}B H/s)",
+        crack_times["offline_gpu"])
+    ct.add_row(
+        f"Online Throttled ({ONLINE_THROTTLED_SPEED} att/s)",
+        crack_times["online_throttled"])
     if not zxcvbn_result.get("error"):
         ct.add_row("zxcvbn — Offline slow (10k H/s)",
                     str(zxcvbn_result["crack_offline"]))
@@ -503,7 +593,8 @@ def _render_report(
     patterns = zxcvbn_result.get("patterns", [])
     if patterns:
         pt = Table(box=box.ROUNDED,
-                   title="[bold bright_cyan]Detected Patterns[/bold bright_cyan]",
+                   title="[bold bright_cyan]Detected Patterns"
+                         "[/bold bright_cyan]",
                    header_style="bold", show_lines=True)
         pt.add_column("Pattern Type", style="cyan")
         pt.add_column("Matched Token (masked)")
@@ -524,23 +615,25 @@ def _render_report(
     if warning or suggestions:
         parts = []
         if warning:
-            parts.append(f"  [bold red]⚠  Warning:[/bold red]  "
-                         f"{rich_escape(str(warning))}")
+            parts.append(
+                f"  [bold red]⚠  Warning:[/bold red]  "
+                f"{rich_escape(str(warning))}")
         for s in suggestions:
-            parts.append(f"  [yellow]→[/yellow]  {rich_escape(str(s))}")
-        console.print(Panel("\n".join(parts),
-                            title="[bold yellow] Feedback [/bold yellow]",
-                            border_style="yellow", box=box.ROUNDED))
+            parts.append(
+                f"  [yellow]→[/yellow]  {rich_escape(str(s))}")
+        console.print(Panel(
+            "\n".join(parts),
+            title="[bold yellow] Feedback [/bold yellow]",
+            border_style="yellow", box=box.ROUNDED))
     console.print()
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  8. Analysis Pipeline
+#  7. Analysis Pipeline
 # ═══════════════════════════════════════════════════════════════════
 
 def _run_analysis(skip_breach: bool = False) -> None:
     """Prompt for a password and run the full analysis pipeline."""
-    global _inflight_password, _inflight_zxcvbn
     console.print()
 
     if not sys.stdin.isatty():
@@ -549,7 +642,8 @@ def _run_analysis(skip_breach: bool = False) -> None:
         return
 
     try:
-        password = getpass("  🔑  Enter password to analyse (input hidden): ")
+        password = getpass(
+            "  🔑  Enter password to analyse (input hidden): ")
     except (EOFError, KeyboardInterrupt):
         console.print("\n[dim]  Cancelled.[/dim]")
         return
@@ -558,88 +652,115 @@ def _run_analysis(skip_breach: bool = False) -> None:
         console.print("[red]  No password provided.[/red]")
         return
     if len(password) > MAX_PASSWORD_LENGTH:
-        console.print(f"[red]  Password exceeds {MAX_PASSWORD_LENGTH} "
-                      f"character limit.[/red]")
+        console.print(
+            f"[red]  Password exceeds {MAX_PASSWORD_LENGTH} "
+            f"character limit.[/red]")
         _secure_wipe_str(password)
         del password
         return
 
     pw_len = len(password)
-    _inflight_password = password
 
-    with Progress(SpinnerColumn("dots"),
-                  TextColumn("[bright_cyan]{task.description}[/bright_cyan]"),
-                  console=console, transient=True) as progress:
+    with _SecureContext(password) as ctx:
+        with Progress(
+            SpinnerColumn("dots"),
+            TextColumn("[bright_cyan]{task.description}[/bright_cyan]"),
+            console=console, transient=True,
+        ) as progress:
 
-        task = progress.add_task("Computing entropy…", total=None)
-        charset_size = calculate_charset_size(password)
-        entropy_bits = compute_entropy(password)
-        entropy_label, entropy_emoji, entropy_style = classify_entropy(entropy_bits)
-        progress.update(task, description="Entropy ✓")
+            task = progress.add_task("Computing entropy…", total=None)
+            charset_size = _calculate_charset_size(password)
+            entropy_bits = _compute_entropy(password)
+            entropy_label, entropy_emoji, entropy_style = \
+                _classify_entropy(entropy_bits)
+            progress.update(task, description="Entropy ✓")
 
-        progress.update(task, description="Running pattern analysis (zxcvbn)…")
-        zxcvbn_result = analyse_patterns(password)
-        _inflight_zxcvbn = zxcvbn_result
-        progress.update(task, description="Patterns ✓")
+            progress.update(
+                task, description="Running pattern analysis (zxcvbn)…")
+            zxcvbn_result = _analyse_patterns(password)
+            ctx.zxcvbn_result = zxcvbn_result
+            progress.update(task, description="Patterns ✓")
 
-        if skip_breach:
-            breached, breach_count, breach_error = False, -1, "Skipped by user"
-        else:
-            progress.update(task, description="Querying HIBP (k-Anonymity)…")
-            breached, breach_count, breach_error = check_hibp(password)
-        progress.update(task, description="Breach check ✓")
+            if skip_breach:
+                breached, breach_count, breach_error = \
+                    False, -1, "Skipped by user"
+            else:
+                progress.update(
+                    task, description="Querying HIBP (k-Anonymity)…")
+                breached, breach_count, breach_error = \
+                    _check_hibp(password)
+            progress.update(task, description="Breach check ✓")
 
-        progress.update(task, description="Estimating crack times…")
-        crack_times = estimate_crack_times(password)
-        progress.update(task, description="Complete ✓")
+            progress.update(
+                task, description="Estimating crack times…")
+            crack_times = _estimate_crack_times(password)
+            progress.update(task, description="Complete ✓")
 
-    _render_report(
-        pw_len=pw_len, entropy_bits=entropy_bits,
-        entropy_label=entropy_label, entropy_emoji=entropy_emoji,
-        entropy_style=entropy_style, zxcvbn_result=zxcvbn_result,
-        breached=breached, breach_count=breach_count,
-        breach_error=breach_error or "", crack_times=crack_times,
-        charset_size=charset_size,
-    )
+        _render_report(
+            pw_len=pw_len, entropy_bits=entropy_bits,
+            entropy_label=entropy_label, entropy_emoji=entropy_emoji,
+            entropy_style=entropy_style, zxcvbn_result=zxcvbn_result,
+            breached=breached, breach_count=breach_count,
+            breach_error=breach_error or "", crack_times=crack_times,
+            charset_size=charset_size,
+        )
 
-    secure_cleanup(password, zxcvbn_result)
-    _inflight_password = None
-    _inflight_zxcvbn = None
+    # _SecureContext.__exit__ already called _secure_cleanup + gc
     del password, zxcvbn_result
-    gc.collect()
     console.print("[dim]  🧹  Password wiped from memory.[/dim]\n")
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  9. Info Screens
+#  8. Info Screens
 # ═══════════════════════════════════════════════════════════════════
 
 def _show_methodology() -> None:
     console.print(Panel(
         "[bold bright_cyan]Analysis Methodology[/bold bright_cyan]\n\n"
+
         "[bold]1. Entropy Calculation[/bold]\n"
         "   Formula: E = L × log₂(R)\n"
         "   L = password length, R = character-set size.\n"
         "   Bands: <40 Critical │ 40-60 Weak │ 60-80 Good │ "
         "80-100 Strong │ 100+ Excellent\n\n"
+        "   [yellow]Caveat:[/yellow] Shannon entropy represents the "
+        "theoretical maximum for a\n"
+        "   perfectly random string of that length.  A password like\n"
+        "   'Password123!' has high entropy (78 bits) but near-zero\n"
+        "   practical strength.  The zxcvbn score (below) measures\n"
+        "   practical resistance to modern cracking dictionaries.\n\n"
+
         "[bold]2. Pattern Recognition (zxcvbn)[/bold]\n"
         "   Detects keyboard walks, dictionary words, names, dates,\n"
         "   l33t substitutions, repeats, and sequences.  Produces a\n"
         "   0-4 strength score and crack-time estimates across four\n"
-        "   attack scenarios.\n\n"
+        "   attack scenarios.  Subject to a 5-second SIGALRM timeout\n"
+        "   to prevent CPU exhaustion on adversarial inputs.\n\n"
+
         "[bold]3. Breach Lookup (HIBP k-Anonymity)[/bold]\n"
         "   SHA-1 hashes the password locally.  Only the first 5 hex\n"
-        "   characters are sent to the API.  The remaining 35 are\n"
-        "   matched locally.  The plaintext never leaves your machine.\n\n"
+        "   characters are sent to the API.  The response is streamed\n"
+        "   line-by-line (iter_lines) so the full suffix list is never\n"
+        "   materialised in memory.  The plaintext never leaves your\n"
+        "   machine.\n\n"
+
         "[bold]4. Crack-Time Estimation[/bold]\n"
         "   Offline GPU: 100 billion hashes/second.\n"
         "   Online throttled: 100 attempts/second.\n"
         "   Computed in log-space for arbitrary keyspace sizes.\n\n"
-        "[bold]5. Memory Sanitisation[/bold]\n"
+
+        "[bold]5. Memory Sanitisation (best-effort)[/bold]\n"
         "   After analysis the password's character buffer is zeroed\n"
         "   via ctypes.memset (offset past the PyObject header).\n"
         "   zxcvbn's internal copies and pattern tokens are also\n"
-        "   wiped.  Best-effort forensic mitigation.",
+        "   wiped.  A context manager ensures cleanup even on\n"
+        "   exceptions or signals.\n\n"
+        "   [yellow]Limitation:[/yellow] Python strings are immutable."
+        "  Copies may persist\n"
+        "   in OS terminal buffers, CPython allocator arenas, and GC\n"
+        "   generations.  This wipe reduces exposure but cannot fully\n"
+        "   guarantee removal.  For a hard guarantee, input collection\n"
+        "   and hashing must use C/Rust with mlock'd mutable buffers.",
         border_style="bright_cyan", box=box.ROUNDED, padding=(1, 2),
     ))
 
@@ -659,7 +780,7 @@ def _show_about() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  10. Main
+#  9. Main
 # ═══════════════════════════════════════════════════════════════════
 
 def main() -> None:
