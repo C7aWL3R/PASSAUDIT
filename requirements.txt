@@ -1,0 +1,5 @@
+# PassAudit v2.1.0
+# Install: pip install -r requirements.txt
+zxcvbn-python>=4.4.24
+requests>=2.31.0
+rich>=13.7.0
